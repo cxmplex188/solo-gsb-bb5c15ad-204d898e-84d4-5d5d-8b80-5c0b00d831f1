@@ -1772,6 +1772,112 @@ def test_concurrent_reversals_refund_only_once(client):
 
 
 # --------------------------------------------------------------------------- #
+# 库存累加越界预检：SQLite INTEGER 是有符号 64 位整数，balance + 份数越界会被
+# 存成 REAL 丢失整数精度；补库存与冲正均在写事务内预检，等于上限允许、超过 409
+# --------------------------------------------------------------------------- #
+
+INT64_MAX = 2**63 - 1
+
+
+def test_add_inventory_accumulates_up_to_int64_limit(client):
+    s1 = make_sample(client, "S1")
+    r = add_inventory(client, s1, INT64_MAX - 5)
+    assert r.status_code == 200, r.text
+    assert r.json()["balance"] == INT64_MAX - 5
+    # 累加结果恰好等于上限：允许提交
+    r = add_inventory(client, s1, 5)
+    assert r.status_code == 200, r.text
+    assert r.json()["balance"] == INT64_MAX
+    assert get_inventory(client, s1).json()["balance"] == INT64_MAX
+
+
+def test_add_inventory_over_int64_limit_returns_409_and_changes_nothing(client):
+    s1 = make_sample(client, "S1")
+    add_inventory(client, s1, INT64_MAX - 1)
+    before = get_inventory(client, s1).json()
+
+    r = add_inventory(client, s1, 2)  # (上限-1) + 2 = 上限+1，越界
+    assert r.status_code == 409, r.text
+    # 409 指出样本、当前余额与本次增量
+    assert r.json()["detail"]["overflows"] == [{
+        "sample_id": s1, "sample_name": "S1",
+        "current_balance": INT64_MAX - 1, "delta": 2,
+    }]
+    # 余额与更新时间都保持不变
+    assert get_inventory(client, s1).json() == before
+    # 恰好补到上限仍允许
+    r = add_inventory(client, s1, 1)
+    assert r.status_code == 200, r.text
+    assert r.json()["balance"] == INT64_MAX
+
+
+def test_add_inventory_portions_beyond_int64_is_overflow_not_error(client):
+    # 单次增量本身超过上限（JSON/Python 可表达的任意精度整数）：按越界 409 处理，
+    # 而不是让 SQLite 绑定参数溢出成 5xx
+    s1 = make_sample(client, "S1")
+    r = add_inventory(client, s1, INT64_MAX + 1)
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["overflows"][0]["delta"] == INT64_MAX + 1
+    assert get_inventory(client, s1).json()["balance"] == 0
+
+
+def test_reversal_refund_up_to_int64_limit_succeeds(client):
+    s1 = make_sample(client, "S1")
+    add_inventory(client, s1, 10)
+    prep_id = prepare(client, s1, 2).json()["id"]  # 消耗 2 → 余 8
+    add_inventory(client, s1, INT64_MAX - 10)      # 8 + (上限-10) = 上限-2
+    # 返还 2 份后恰好等于上限：允许冲正
+    r = reverse_preparation(client, prep_id)
+    assert r.status_code == 201, r.text
+    assert r.json()["items"][0]["balance"] == INT64_MAX
+    assert get_inventory(client, s1).json()["balance"] == INT64_MAX
+
+
+def test_reversal_refund_over_int64_limit_rolls_back_everything(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    s3 = make_sample(client, "S3")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1},
+        {"batch_id": s2, "portions": 1},
+        {"batch_id": s3, "portions": 1},
+    ])
+    add_inventory(client, s1, 10)
+    add_inventory(client, s2, 10)
+    add_inventory(client, s3, 10)
+    prep_id = prepare(client, p1, 2).json()["id"]  # 各消耗 2 → 各余 8
+
+    # S1、S2 补到 上限-1：各返还 2 份均越界；S3 保持 8，返还本可成功
+    add_inventory(client, s1, INT64_MAX - 9)
+    add_inventory(client, s2, INT64_MAX - 9)
+    before_s1 = get_inventory(client, s1).json()
+    before_s2 = get_inventory(client, s2).json()
+    before_s3 = get_inventory(client, s3).json()
+
+    r = reverse_preparation(client, prep_id)
+    assert r.status_code == 409, r.text
+    # 先核对全部样本：超限项按样本 id 升序列出样本、当前余额与本次增量
+    assert r.json()["detail"]["overflows"] == [
+        {"sample_id": s1, "sample_name": "S1",
+         "current_balance": INT64_MAX - 1, "delta": 2},
+        {"sample_id": s2, "sample_name": "S2",
+         "current_balance": INT64_MAX - 1, "delta": 2},
+    ]
+    # 整体回滚：任一样本余额与更新时间不变（S3 也不返还），冲正记录未生成
+    assert get_inventory(client, s1).json() == before_s1
+    assert get_inventory(client, s2).json() == before_s2
+    assert get_inventory(client, s3).json() == before_s3
+    assert get_reversal(client, prep_id).status_code == 404
+
+    # 再次制备消耗腾出空间后，同一记录可正常冲正
+    assert prepare(client, p1, 2).status_code == 201
+    r = reverse_preparation(client, prep_id)
+    assert r.status_code == 201, r.text
+    assert {x["sample_id"]: x["balance"] for x in r.json()["items"]} == {
+        s1: INT64_MAX - 1, s2: INT64_MAX - 1, s3: 8}
+
+
+# --------------------------------------------------------------------------- #
 # POST /preparation-jobs 整单制备
 # --------------------------------------------------------------------------- #
 

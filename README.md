@@ -18,6 +18,7 @@
 - **整单制备**：`POST /preparation-jobs` 一次接收**非空制备清单**（每项为已有批次 id + 正整数制备次数），同一批次重复出现时先**合并次数**；先沿配方图计算每项对原始样本的整数需求，再**按样本汇总整单需求**统一核算（共享样本不会被各项分别判为足量）；读取余额、核算缺口、扣减库存与写入各批次制备记录在**同一写事务**完成，任一样本不足返回包含该样本**总需求、余额与缺口**的 **409**、整单不留记录且余额不变；成功时返回各批次制备记录 id 与整单消耗，每条记录仍可由 `GET /preparations/{id}` 读取
 - **只读排产预演**：`POST /preparation-jobs/selection-preview` 接收 **1～12 条候选制备单**（每条为已有批次 id + 正整数次数，按请求位置标识订单，**允许重复批次**、不合并次数），复用配方图整数消耗展开计算每条订单对原始样本的需求，依据**同一库存快照**选出各样本总需求均不超过余额的子集——先**最大化入选订单数**，再**最大化入选制备次数之和**，仍并列时取**入选位置序列字典序最小**者；返回入选/未入选位置、按样本汇总的消耗与剩余库存，库存全不足时返回空集；**不扣减库存、不创建制备记录**
 - **制备记录冲正**：`POST /preparations/{id}/reversal` 对**存在且尚未冲正**的制备记录，按记录**已保存的消耗明细逐样本返还**原始样本库存，并保存与该记录**一一对应**的冲正时间；读取记录、判重、返还与保存在**同一 SQLite 写事务**内完成；**重复冲正幂等**返回同一冲正记录（200）且不再次返还，未知制备记录返回 **404**。`GET /preparations/{id}/reversal` 查询冲正时间、各样本返还份数与当前库存（明细按样本 id 升序），未冲正返回 **404**。单批制备与整单制备生成的记录均可冲正；冲正**不删改**原制备记录与消耗明细，`GET /preparations/{id}` 照常可查
+- **库存累加越界防护**：SQLite `INTEGER` 是有符号 64 位整数（上限 `2^63 − 1 = 9223372036854775807`），直接在 SQL 中执行 `balance + 份数` 一旦越界，结果会被存成 `REAL`（浮点）并丢失整数精度；**补库存**与**制备冲正**都在各自写事务内按“当前余额 + 本次增量”预检——结果**恰好等于上限允许提交**，**超过上限返回 409**（`detail.overflows` 按样本 id 升序给出样本、当前余额与本次增量）；冲正涉及多个样本时**先核对全部样本再整体返还**，失败不改变任一余额、更新时间与冲正记录
 - **原始样本质量封存**：可对已有**原始样本**封存（`POST /batches/{id}/seal`）与解除封存（`POST /batches/{id}/unseal`），每次状态变更都必须给出**原因**并记录**时间**，`GET /batches/{id}/seal` 查询当前状态与**全部状态变更历史**；仅原始样本可封存（混样批次返回 **400**），**同一状态重复操作返回 409**（不新增流水）。单批制备与整单制备在同一 SQLite 写事务内沿**现有配方图**（含嵌套混样、多路径汇合）识别本次会消耗的全部上游原始样本，任一处于封存中即返回 **409** 与按样本 id 升序的**封存样本清单**，**整次请求不扣库存、不写制备记录**（封存检查先于库存缺口检查）；**解除封存后可再次制备**。封存状态变更与制备核算共用 `BEGIN IMMEDIATE` 写事务串行化，并发封存不会被制备漏拦；封存不影响**历史制备记录**的查询与冲正
 - **原始样本库存盘点**：`POST /inventory-counts/preview` 接收**非空且样本 id 不重复**的盘点项（样本 id + 实盘**非负整数**份数），按**同一库存快照**返回各项账面数（**无库存行按 0**）与差额，**只读不写库**；`POST /inventory-counts` 接收盘点项、预演账面数与**非空白原因**，在**同一 SQLite 写事务**内核对全部样本**仍为原始样本**且余额**与预演账面数一致**——任一变化返回 **409** 与冲突项、**整单不改库存、不留记录**，全部一致时按实盘数更新余额（无库存行的样本新建库存行）并保存各项**调整前后数、差额、原因与时间**；`GET /inventory-counts/{id}` 查询已提交的盘点明细
 - 依赖安装与数据库建表全部纳入启动流程，无需手工初始化
@@ -65,7 +66,7 @@ docker compose up --build
 | `GET` | `/batches/{id}/composition` | 递归追溯原始样本占比 |
 | `POST` | `/batches/{id}/recipe-preview` | 配方变更影响预演（不写库） |
 | `POST` | `/batches/{id}/portion-diagnosis` | 份数诊断：假设仅一项份数记错，反推正整数份数（不写库） |
-| `POST` | `/batches/{id}/inventory` | 为原始样本补入正整数份库存（累加） |
+| `POST` | `/batches/{id}/inventory` | 为原始样本补入正整数份库存（累加；累加越界 409） |
 | `GET` | `/batches/{id}/inventory` | 查询原始样本库存余额（未补入为 0） |
 | `POST` | `/batches/{id}/seal` | 封存原始样本（记录原因与时间，重复封存 409） |
 | `POST` | `/batches/{id}/unseal` | 解除封存原始样本（记录原因与时间，未封存时 409） |
@@ -74,7 +75,7 @@ docker compose up --build
 | `POST` | `/preparation-jobs` | 整单制备：多批次清单合并次数、按样本汇总需求一次扣减（封存或库存不足均 409 且整单回滚） |
 | `POST` | `/preparation-jobs/selection-preview` | 只读排产预演：1～12 条候选制备单按同一库存快照选型（不扣库存、不写记录） |
 | `GET` | `/preparations/{id}` | 按记录 id 查询制备记录（消耗明细 + 当前剩余库存） |
-| `POST` | `/preparations/{id}/reversal` | 制备记录冲正：按已保存消耗明细逐样本返还库存（重复冲正幂等，未知记录 404） |
+| `POST` | `/preparations/{id}/reversal` | 制备记录冲正：按已保存消耗明细逐样本返还库存（重复冲正幂等，未知记录 404；返还越界 409 且整体回滚） |
 | `GET` | `/preparations/{id}/reversal` | 查询冲正时间、各样本返还份数及当前库存（未冲正 404） |
 | `POST` | `/inventory-counts/preview` | 库存盘点预演：同一库存快照返回账面数与实盘差额（只读，不写库） |
 | `POST` | `/inventory-counts` | 提交盘点：核对账面数一致后按实盘数更新余额（任一变化 409 且整单回滚） |
@@ -367,6 +368,8 @@ curl -X POST http://localhost:8000/batches/4/portion-diagnosis \
 
 **补入库存 / 查询余额**：原始样本以“份”为单位持有库存。`POST /batches/{id}/inventory` 为**已存在的原始样本**补入正整数份（`portions`，累加到当前余额），返回补入后的余额与更新时间；`GET /batches/{id}/inventory` 查询余额，**从未补入过的样本余额为 0**（`updated_at` 为 `null`）。未知批次返回 **400**；混样批次不能持有库存，返回 **400**；非正整数份数返回 **422**。
 
+**累加越界防护**：库存余额以 SQLite 有符号 64 位整数存储，上限为 `2^63 − 1 = 9223372036854775807`。若 `当前余额 + 本次补入份数` 超过该上限，SQLite 会把累加结果存成 `REAL`（浮点）并丢失整数精度，因此补入在写事务内先按当前余额与本次增量预检：**恰好等于上限允许提交**；**超过上限返回 409**，`detail.overflows` 给出样本、当前余额与本次增量，余额与更新时间均不变化。
+
 ```bash
 # S1=1、S2=2，补入 10 份 S1 与 5 份 S2
 curl -X POST http://localhost:8000/batches/1/inventory \
@@ -594,6 +597,7 @@ curl -X POST http://localhost:8000/preparations/1/reversal
 
 - `returned_portions` 即制备记录保存的各样本消耗份数；`balance` 为返还后的当前库存；`items` 按**样本 id 升序**；
 - `updated_at` 是样本库存的**最近一次补入时间**，冲正返还不改写该时间（从未补入过时为 `null`）。
+- 返还同样受有符号 64 位整数上限（`2^63 − 1`）约束：冲正在写事务内**先核对全部样本**的“当前余额 + 返还份数”，任一越界即整体回滚返回 **409**（`detail.overflows` 按样本 id 升序给出样本、当前余额与本次增量），**任一余额、更新时间与冲正记录都不变**；全部通过（含恰好等于上限）才写冲正记录并整体返还。
 
 **重复冲正**返回同一冲正记录（`reversed_at` 与首次一致）、状态码 **200**，库存不会被二次返还：
 
@@ -836,6 +840,17 @@ curl -X POST http://localhost:8000/batches/3/inventory -H 'Content-Type: applica
 # 补入非正整数份（0 / 负数 / 小数 / 字符串 / 布尔）→ 422
 curl -X POST http://localhost:8000/batches/1/inventory -H 'Content-Type: application/json' \
   -d '{"portions": 0}'
+
+# 补入后余额将超过有符号 64 位整数上限（2^63-1）→ 409，余额与更新时间不变
+# （恰好累加到上限允许提交；detail.overflows 指出样本、当前余额与本次增量）
+curl -X POST http://localhost:8000/batches/1/inventory -H 'Content-Type: application/json' \
+  -d '{"portions": 9223372036854775807}'
+# {"detail":{"message":"库存余额累加结果超过 SQLite 有符号 64 位整数上限","overflows":[{"sample_id":1,"current_balance":1,"delta":9223372036854775807,"sample_name":"S1"}]}}
+
+# 冲正返还后任一样本余额将超过上限 → 409：先核对全部样本再整体返还，
+# 失败时任一余额、更新时间与冲正记录都不变
+curl -X POST http://localhost:8000/preparations/1/reversal
+# {"detail":{"message":"库存余额累加结果超过 SQLite 有符号 64 位整数上限","overflows":[{"sample_id":1,"current_balance":9223372036854775806,"delta":2,"sample_name":"S1"}]}}
 
 # 制备不存在的批次 → 400 {"detail":"未知批次 id: 999"}
 curl -X POST http://localhost:8000/batches/999/preparations -H 'Content-Type: application/json' \
