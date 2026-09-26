@@ -7,6 +7,9 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 
+# SQLite INTEGER 上限（有符号 64 位）：余额累加不得超过该值
+INT64_MAX = 2**63 - 1
+
 
 def plan(client, a, b, sample, numerator, denominator, cap):
     return client.post("/pool-plans", json={
@@ -1257,6 +1260,50 @@ def test_inventory_only_for_samples(client):
     assert "原始样本" in r.json()["detail"]
 
 
+def test_add_inventory_up_to_int64_max_succeeds(client):
+    s1 = make_sample(client, "S1")
+    # 恰好累加到上限：允许提交
+    r = add_inventory(client, s1, INT64_MAX - 5)
+    assert r.status_code == 200, r.text
+    assert r.json()["balance"] == INT64_MAX - 5
+    r = add_inventory(client, s1, 5)
+    assert r.status_code == 200, r.text
+    assert r.json()["balance"] == INT64_MAX
+    assert get_inventory(client, s1).json()["balance"] == INT64_MAX
+
+
+def test_add_inventory_overflow_returns_409_and_changes_nothing(client):
+    s1 = make_sample(client, "S1")
+    add_inventory(client, s1, 10)
+    before = get_inventory(client, s1).json()
+
+    # 10 + (MAX-5) > MAX：超限返回 409，指出样本、当前余额与本次增量
+    r = add_inventory(client, s1, INT64_MAX - 5)
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["message"] == "库存累加结果超过 SQLite 有符号 64 位整数上限"
+    assert detail["overflows"] == [{
+        "sample_id": s1, "sample_name": "S1",
+        "balance": 10, "delta": INT64_MAX - 5,
+    }]
+    # 余额与更新时间都保持不变
+    assert get_inventory(client, s1).json() == before
+
+    # 单次补入份数本身超过上限（无库存行，余额按 0）同样 409
+    s2 = make_sample(client, "S2")
+    r = add_inventory(client, s2, INT64_MAX + 1)
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["overflows"] == [{
+        "sample_id": s2, "sample_name": "S2",
+        "balance": 0, "delta": INT64_MAX + 1,
+    }]
+    assert get_inventory(client, s2).json()["balance"] == 0
+
+    # 不超限的补入仍可正常提交
+    assert add_inventory(client, s1, 5).status_code == 200
+    assert get_inventory(client, s1).json()["balance"] == 15
+
+
 # --------------------------------------------------------------------------- #
 # POST /batches/{id}/preparations + GET /preparations/{id}
 # --------------------------------------------------------------------------- #
@@ -1769,6 +1816,80 @@ def test_concurrent_reversals_refund_only_once(client):
     assert sorted(codes) == [200] * 5 + [201]
     assert get_inventory(client, s1).json()["balance"] == 5  # 只返还 2 份一次
     assert set(times) == {get_reversal(client, prep_id).json()["reversed_at"]}
+
+
+def test_reversal_refund_up_to_int64_max_succeeds(client):
+    s1 = make_sample(client, "S1")
+    add_inventory(client, s1, 10)
+    prep_id = prepare(client, s1, 2).json()["id"]  # 余 8，消耗 2
+    # 补到 MAX-2：冲正返还 2 份后恰好等于上限，允许提交
+    assert add_inventory(client, s1, INT64_MAX - 10).status_code == 200
+    assert get_inventory(client, s1).json()["balance"] == INT64_MAX - 2
+
+    r = reverse_preparation(client, prep_id)
+    assert r.status_code == 201, r.text
+    assert r.json()["items"][0]["balance"] == INT64_MAX
+    assert get_inventory(client, s1).json()["balance"] == INT64_MAX
+
+
+def test_reversal_overflow_returns_409_and_changes_nothing(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    add_inventory(client, s1, 10)
+    add_inventory(client, s2, 10)
+    prep_id = prepare(client, p1, 2).json()["id"]  # 各消耗 2 → 8、8
+    # S2 补到上限：返还 2 份将超限；S1 返还后不超限
+    assert add_inventory(client, s2, INT64_MAX - 8).status_code == 200
+    before_s1 = get_inventory(client, s1).json()
+    before_s2 = get_inventory(client, s2).json()
+
+    r = reverse_preparation(client, prep_id)
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["message"] == "库存累加结果超过 SQLite 有符号 64 位整数上限"
+    # 只列出超限的 S2：样本、当前余额与本次增量
+    assert detail["overflows"] == [{
+        "sample_id": s2, "sample_name": "S2",
+        "balance": INT64_MAX, "delta": 2,
+    }]
+
+    # 整体回滚：S1 也未返还，余额与更新时间不变，冲正记录未生成
+    assert get_inventory(client, s1).json() == before_s1
+    assert get_inventory(client, s2).json() == before_s2
+    assert get_reversal(client, prep_id).status_code == 404
+
+    # 消耗 S2 两份腾出空间后，同一记录可正常冲正（首次成功为 201）
+    assert prepare(client, s2, 2).status_code == 201
+    r = reverse_preparation(client, prep_id)
+    assert r.status_code == 201, r.text
+    assert get_inventory(client, s1).json()["balance"] == 10
+    assert get_inventory(client, s2).json()["balance"] == INT64_MAX
+
+
+def test_reversal_overflow_lists_all_overflowing_samples(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    add_inventory(client, s1, 10)
+    add_inventory(client, s2, 10)
+    prep_id = prepare(client, p1, 2).json()["id"]  # 各消耗 2 → 8、8
+    # 两个样本都补到上限：冲正时两者都超限，按样本 id 升序全部列出
+    assert add_inventory(client, s1, INT64_MAX - 8).status_code == 200
+    assert add_inventory(client, s2, INT64_MAX - 8).status_code == 200
+
+    r = reverse_preparation(client, prep_id)
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["overflows"] == [
+        {"sample_id": s1, "sample_name": "S1", "balance": INT64_MAX, "delta": 2},
+        {"sample_id": s2, "sample_name": "S2", "balance": INT64_MAX, "delta": 2},
+    ]
+    # 任一样本超限即整体回滚：两个余额都不变、无冲正记录
+    assert get_inventory(client, s1).json()["balance"] == INT64_MAX
+    assert get_inventory(client, s2).json()["balance"] == INT64_MAX
+    assert get_reversal(client, prep_id).status_code == 404
 
 
 # --------------------------------------------------------------------------- #

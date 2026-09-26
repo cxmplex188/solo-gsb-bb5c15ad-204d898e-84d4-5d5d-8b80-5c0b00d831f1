@@ -11,7 +11,7 @@
 - GET  /batches/{batch_id}/composition 递归计算原始样本占比（约分后的分子/分母）
 - POST /batches/{batch_id}/recipe-preview 配方变更影响预演（内存计算，不写库）
 - POST /batches/{batch_id}/portion-diagnosis 份数诊断：假设仅一项份数记错，反推正整数份数（不写库）
-- POST /batches/{batch_id}/inventory   为原始样本补入正整数份库存（累加）
+- POST /batches/{batch_id}/inventory   为原始样本补入正整数份库存（累加；结果超 SQLite 64 位整数上限返回 409）
 - GET  /batches/{batch_id}/inventory   查询原始样本库存余额
 - POST /batches/{batch_id}/seal        封存原始样本（记录原因与时间，重复封存 409）
 - POST /batches/{batch_id}/unseal      解除原始样本封存（记录原因与时间，重复解除 409）
@@ -20,7 +20,7 @@
 - POST /preparation-jobs               整单制备：多批次清单合并核算，按样本汇总需求一次扣减（不足 409 且整单回滚）
 - POST /preparation-jobs/selection-preview 只读排产预演：1～12 条候选制备单按同一库存快照选型（不扣库存、不写记录）
 - GET  /preparations/{preparation_id}  按记录 id 查询制备记录（含消耗明细与当前剩余库存）
-- POST /preparations/{preparation_id}/reversal 制备记录冲正：按已保存消耗明细逐样本返还库存（重复冲正幂等，未知记录 404）
+- POST /preparations/{preparation_id}/reversal 制备记录冲正：按已保存消耗明细逐样本返还库存（重复冲正幂等，未知记录 404；任一返还超上限 409 且整体回滚）
 - GET  /preparations/{preparation_id}/reversal 查询冲正时间、各样本返还份数及当前库存（未冲正 404）
 - POST /inventory-counts/preview       库存盘点预演：同一库存快照返回各样本账面数与实盘差额（只读，不写库）
 - POST /inventory-counts               提交盘点：写事务内核对账面数一致后按实盘数更新余额（任一变化 409 且整单回滚）
@@ -735,7 +735,7 @@ def _inventory_out(conn: sqlite3.Connection, row: sqlite3.Row) -> InventoryOut:
 @app.post(
     "/batches/{batch_id}/inventory",
     response_model=InventoryOut,
-    summary="为原始样本补入库存（正整数份数，累加到余额）",
+    summary="为原始样本补入库存（正整数份数，累加到余额；累加结果超 SQLite 64 位整数上限返回 409）",
 )
 def add_inventory(
     batch_id: int,
@@ -753,6 +753,9 @@ def add_inventory(
         )
 
     conn.execute("BEGIN IMMEDIATE")
+    # 同一写事务内先预检累加结果是否超过 SQLite INTEGER 上限：超限的和会被
+    # SQLite 存成 REAL 丢失整数精度，必须回滚拦截（恰好等于上限时允许提交）
+    _ensure_balance_headroom(conn, {batch_id: payload.portions})
     # 同一写事务内累加余额并刷新更新时间：UPSERT 幂等兼容“首次补入/再次补入”
     conn.execute(
         """
@@ -1063,6 +1066,65 @@ def _ensure_inventory(conn: sqlite3.Connection, required: dict[int, int]) -> Non
     )
 
 
+# SQLite INTEGER 为有符号 64 位整数：余额累加结果超过该上限时，
+# SQLite 会把和存成 REAL（浮点），丢失整数精度，必须在写入前拦截
+MAX_SQLITE_INTEGER = 2**63 - 1
+
+
+def _ensure_balance_headroom(conn: sqlite3.Connection, deltas: dict[int, int]) -> None:
+    """在同一写事务内预检各原始样本“当前余额 + 本次增量”是否超过 SQLite INTEGER 上限。
+
+    deltas 为 {原始样本 id: 正整数增量}（无库存行的样本当前余额按 0）。结果恰好
+    等于上限时允许提交；任一样本超限即回滚当前事务并抛 409：detail.overflows
+    按样本 id 升序给出每个超限样本的当前余额与本次增量；全部未超限时不做任何
+    修改、直接返回。调用方须先核对完全部样本，再统一执行累加写入。
+    """
+    sample_ids = sorted(deltas)
+    balances = (
+        {
+            r["sample_id"]: r["balance"]
+            for r in conn.execute(
+                "SELECT sample_id, balance FROM sample_inventory WHERE sample_id IN (%s)"
+                % ", ".join("?" for _ in sample_ids),
+                sample_ids,
+            )
+        }
+        if sample_ids
+        else {}
+    )
+
+    overflows = []
+    for sid in sample_ids:
+        balance = balances.get(sid, 0)
+        if balance + deltas[sid] > MAX_SQLITE_INTEGER:
+            overflows.append({
+                "sample_id": sid,
+                "balance": balance,
+                "delta": deltas[sid],
+            })
+    if not overflows:
+        return
+    overflow_ids = [item["sample_id"] for item in overflows]
+    names = {
+        r["id"]: r["name"]
+        for r in conn.execute(
+            "SELECT id, name FROM batches WHERE id IN (%s)"
+            % ", ".join("?" for _ in overflow_ids),
+            overflow_ids,
+        )
+    }
+    for item in overflows:
+        item["sample_name"] = names[item["sample_id"]]
+    conn.rollback()
+    raise HTTPException(
+        status.HTTP_409_CONFLICT,
+        detail={
+            "message": "库存累加结果超过 SQLite 有符号 64 位整数上限",
+            "overflows": overflows,
+        },
+    )
+
+
 def _ensure_not_sealed(conn: sqlite3.Connection, required: dict[int, int]) -> None:
     """在制备写事务内拦截被封存的上游原始样本。
 
@@ -1220,7 +1282,7 @@ def _build_reversal_out(
     "/preparations/{preparation_id}/reversal",
     response_model=PreparationReversalOut,
     status_code=status.HTTP_201_CREATED,
-    summary="制备记录冲正：按已保存消耗明细逐样本返还原始样本库存",
+    summary="制备记录冲正：按已保存消耗明细逐样本返还原始样本库存（任一返还超上限 409 且整体回滚）",
 )
 def reverse_preparation(
     preparation_id: int,
@@ -1260,6 +1322,11 @@ def reverse_preparation(
             """,
             (preparation_id,),
         ).fetchall()
+        # 先核对全部样本的返还结果都不超 SQLite INTEGER 上限，再整体返还：
+        # 任一超限即整体回滚，任一余额、更新时间与冲正记录都不改变
+        _ensure_balance_headroom(
+            conn, {r["sample_id"]: r["portions"] for r in consumptions}
+        )
         conn.execute(
             "INSERT INTO preparation_reversals (preparation_id) VALUES (?)",
             (preparation_id,),
